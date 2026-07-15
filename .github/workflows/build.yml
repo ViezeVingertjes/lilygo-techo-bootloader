@@ -1,0 +1,112 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # The upstream release this port is built and verified against. Bumping it is a
+  # deliberate act: re-run the hardware check in FLASHING.md before trusting a new one.
+  UPSTREAM_TAG: '0.11.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      # Default GITHUB_TOKEN is read-only, which makes release asset upload 403.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: port
+
+      - uses: actions/setup-python@v5
+        with:
+          # adafruit-nrfutil (the DFU packager) is unmaintained and does not install
+          # cleanly on 3.12+; pin rather than let the runner default drift into it.
+          python-version: '3.11'
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi
+          pip install intelhex adafruit-nrfutil
+          arm-none-eabi-gcc --version | head -1
+
+      - name: Clone upstream bootloader at ${{ env.UPSTREAM_TAG }}
+        run: |
+          git clone --recurse-submodules --depth 1 --branch "$UPSTREAM_TAG" \
+            https://github.com/adafruit/Adafruit_nRF52_Bootloader upstream
+
+      - name: Add board port
+        run: |
+          cp -r port/src/boards/lilygo_techo upstream/src/boards/
+          # The board dir stays untracked on purpose: the Makefile derives the version
+          # from `git describe --dirty`, and a tracked change would stamp every artifact
+          # (and the BLE device-info string) "-dirty".
+          cd upstream
+          version=$(git describe --dirty --always --tags)
+          echo "Build version: $version"
+          test "$version" = "$UPSTREAM_TAG" || {
+            echo "::error::version is '$version', expected '$UPSTREAM_TAG'; the upstream tree is not clean"
+            exit 1
+          }
+
+      - name: Build bootloader
+        run: make -C upstream PYTHON=python3 BOARD=lilygo_techo all
+
+      - name: Verify bootloader artifacts
+        run: |
+          python3 port/tools/verify_artifacts.py upstream/_build/build-lilygo_techo \
+            --sd-hex upstream/lib/softdevice/s140_nrf52_7.3.0/s140_nrf52_7.3.0_softdevice.hex
+
+      - name: Build sample app
+        run: make -C port/sample-app BL_ROOT="$GITHUB_WORKSPACE/upstream"
+
+      - name: Verify sample app targets the S140 7.x application base
+        run: |
+          python3 - <<'PY'
+          import struct, sys
+          APP_BASE, USER_FLASH_END = 0x27000, 0xEA000
+          data = open('port/sample-app/_build/techo_sd730_sample.uf2', 'rb').read()
+          blocks = [data[i:i + 512] for i in range(0, len(data), 512)]
+          for b in blocks:
+              magic0, magic1, _flags, addr, size, _seq, _tot, family = struct.unpack('<8I', b[:32])
+              assert magic0 == 0x0A324655 and magic1 == 0x9E5D5157, 'bad UF2 magic'
+              assert family == 0xADA52840, f'wrong UF2 family 0x{family:08X}'
+              assert APP_BASE <= addr and addr + size <= USER_FLASH_END, \
+                  f'block at 0x{addr:X} is outside the writable app region'
+          sp, reset = struct.unpack('<II', blocks[0][32:40])
+          assert 0x20000000 <= sp <= 0x20040000, f'bad initial SP 0x{sp:08X}'
+          assert APP_BASE <= reset < APP_BASE + 0x1000, f'bad reset vector 0x{reset:08X}'
+          print(f'sample app OK: {len(blocks)} blocks from 0x{APP_BASE:X}, SP=0x{sp:08X}, reset=0x{reset:08X}')
+          PY
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp upstream/_build/build-lilygo_techo/lilygo_techo_bootloader-*_s140_7.3.0.zip dist/
+          cp upstream/_build/build-lilygo_techo/lilygo_techo_bootloader-*_s140_7.3.0.hex dist/
+          cp upstream/_build/build-lilygo_techo/update-lilygo_techo_bootloader-*_nosd.uf2 dist/
+          cp port/sample-app/_build/techo_sd730_sample.uf2 dist/
+          cp upstream/lib/softdevice/s140_nrf52_7.3.0/s140_nrf52_7.3.0_license-agreement.txt dist/
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lilygo-techo-bootloader
+          path: dist/
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The release usually already exists (created with hand-written notes, which is
+          # what pushed the tag). Fall back to generated notes if a tag arrives on its own.
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"

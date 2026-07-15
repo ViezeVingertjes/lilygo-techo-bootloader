@@ -1,0 +1,7 @@
+_build/
+*.o
+*.elf
+*.map
+__pycache__/
+# Build artifacts ship as release assets, not in git.
+dist/
